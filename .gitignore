@@ -1,4 +1,6 @@
 # Private keys never go into git in clear (Lab 2): CA keys, identities' keys, the CI's age key.
+ci.key
+mine.key
 # The identities' keys are committed encrypted only: <key>.age, made by ./keys.sh seal
 private/
 *.key.pem
