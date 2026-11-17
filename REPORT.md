@@ -1,75 +1,74 @@
 # Lab 4 report
 
-Answer from **your** build: every claim points to a file in this repository or to a line in `evidence/`.
-
 ## 1. Inventory
 
-Every key and certificate you created: what it is, algorithm and size, where the key lives, who can read it,
-validity, what it is used for.
 
 | Item | Key location | Readable by | Valid until | Purpose |
 |---|---|---|---|---|
-| root CA, EC P-384, self-signed, `root/certs/ca.cert.pem` | `root/private/ca.key.pem`, encrypted (AES-256, passphrase) | the `root-ca` container (no network); on the host, my user account, but only I know the passphrase | 2046-11-11, 20 years (`openssl x509 -noout -enddate`) | signs the intermediate and the root CRL, nothing else; stopped the rest of the time |
+| root CA, EC P-384, auto-signée, `root/certs/ca.cert.pem` | `root/private/ca.key.pem`, chiffrée AES-256-CBC avec passphrase | uniquement le conteneur `root-ca` (`network_mode: none`). Sur l'hôte, quiconque peut lire le fichier mais seul moi connais la passphrase | 2046-11-12, 20 ans | signe uniquement l'intermédiaire et la CRL root. Arrêtée (`docker compose stop root-ca`) pour le reste du lab |
+| intermediate CA, EC P-384, `intermediate/certs/int.cert.pem` | `intermediate/private/int.key.pem`, non chiffrée | uniquement le conteneur `issuing-ca`, sans réseau | 2046-11-12, 20 ans, voir la note plus bas | signe les certificats serveur et client, les révoque, publie la CRL intermédiaire |
+| www (serveur), EC P-256, `identities/www/www.cert.pem` | `identities/www/www.key.pem`, chiffrée `.age` dans le dépôt | conteneur `client`, copiée vers `nginx` via le volume `identities/www` | 90 jours | authentification TLS du serveur `www.lab.internal` |
+| alice v1, compromise, EC P-256 | détruite, non conservée en clair | — | révoquée le 2026-11-17, serial `1004`, raison `keyCompromise` | simule un ordinateur volé |
+| alice v2, EC P-256, serial `1005`, `identities/alice/alice.cert.pem` | `identities/alice/alice.key.pem.age` | conteneur `client` | 90 jours | rôle admin sur l'API (`/admin`) |
+| bob, EC P-256, `identities/bob/bob.cert.pem` | `identities/bob/bob.key.pem.age` | conteneur `client` | 90 jours | rôle user, `/whoami` uniquement |
+| billing, EC P-256, `identities/billing/billing.cert.pem` | `identities/billing/billing.key.pem.age` | conteneur `client` | 90 jours | identité de service, SAN URI SPIFFE, rôle service, `/invoices` |
+| evil, test, EC P-256 | `identities/evil/evil.key.pem.age` | conteneur `client` | 90 jours | test négatif des `nameConstraints`, hors flux normal |
 
-**Lifetimes.** The root lasts 20 years, the intermediate 10, the server and client certificates 90 days.
-Justify each number: what would a shorter or a longer lifetime cost you? Why 90 days for the server, and not
-1 year, or 7 days?
+Toutes les clés privées n'existent dans le dépôt git qu'en version chiffrée `age`, suffixe `.key.pem.age`, scellées pour 3 destinataires : formateur, CI, moi, voir `recipients.txt`. Aucun fichier `.key.pem` ou `.key` n'est tracké en clair, vérifié sur tout l'historique git.
+
+**Note sur la durée de vie de l'intermédiaire.** Elle a été signée avec `openssl ca -config root/openssl.cnf ...` sans option `-days`, donc elle a hérité du `default_days = 7300` de `root/openssl.cnf`, soit 20 ans, au lieu des 10 ans prévus. C'est une erreur de config : le fichier `openssl.cnf` de la racine devrait fixer `default_days` à la durée voulue pour l'intermédiaire, 3650 jours, puisque ce fichier gouverne tout ce que la racine signe, pas seulement son propre certificat.
+
+**Durées de vie, justifiées.** Racine 20 ans : elle est offline presque tout le temps, la renouveler est coûteux et volontairement rare. Intermédiaire environ 10 à 20 ans : en ligne en permanence, mais la changer oblige à réémettre toutes les feuilles, donc elle reste longue. Feuilles, serveur et client, 90 jours : assez court pour qu'une clé volée expire vite même sans révocation manuelle, assez court pour imposer une habitude de renouvellement automatisé, assez long pour que ce process manuel reste praticable. Une durée d'un an laisserait une clé compromise dangereuse jusqu'à un an si la révocation est oubliée. Une durée de 7 jours demanderait un pipeline d'émission totalement automatisé, qu'on n'a pas ici.
 
 ## 2. Chain
 
-Root, intermediate, leaves, with the extensions that constrain each one (pathlen, nameConstraints, EKU, SAN).
-
 | Certificate | Subject, issuer | Constraining extensions | What they prevent |
 |---|---|---|---|
-| root CA | `C=FR, O=EPITA Lab, CN=EPITA Lab Root CA`, self-signed | `basicConstraints: critical, CA:TRUE, pathlen:1`; `keyUsage: critical, keyCertSign, cRLSign` | `pathlen:1`: below the root, one CA level only; a CA signed by the intermediate is refused. `keyUsage`: the root key signs certificates and CRLs, nothing else |
-
-Read them from the certificates, not from the config:
-`openssl x509 -in root/certs/ca.cert.pem -noout -subject -issuer -ext basicConstraints,keyUsage`.
+| root CA | `C=FR, O=EPITA Lab, CN=EPITA Lab Root CA`, auto-signée | `basicConstraints: critical, CA:TRUE, pathlen:1` ; `keyUsage: critical, keyCertSign, cRLSign` | `pathlen:1` : aucune CA ne peut exister deux niveaux sous la racine. `keyUsage` : cette clé ne signe que des certificats et des CRL, jamais du trafic TLS direct |
+| intermediate CA | `CN=EPITA Lab Issuing CA`, signée par la racine | `basicConstraints: critical, CA:TRUE, pathlen:0` ; `nameConstraints: critical, permitted;DNS:lab.internal` ; `keyUsage: critical, digitalSignature, keyCertSign, cRLSign` | `pathlen:0` : l'intermédiaire ne peut pas créer une autre CA sous elle. `nameConstraints` : elle ne peut pas légitimement vouch pour un nom hors `lab.internal`, même si elle signe un CSR pour ce nom. Vérifié avec `evil.example.com`, rejeté par `openssl verify` avec `error 47: permitted subtree violation` |
+| www, serveur | `CN=www.lab.internal`, signé par l'intermédiaire | `basicConstraints: critical, CA:FALSE` ; `extendedKeyUsage: serverAuth` ; SAN `DNS:www.lab.internal` | `CA:FALSE` : ne peut signer aucun autre certificat. `EKU serverAuth` : ne peut servir de certificat client, testé en le présentant via `--cert`/`--key` au mTLS de nginx, résultat `400 The SSL certificate error` |
+| alice, bob, billing | `CN=alice` / `bob` / `billing`, signés par l'intermédiaire | `basicConstraints: critical, CA:FALSE` ; `extendedKeyUsage: clientAuth` ; SAN `email:...@lab.internal` pour alice et bob, ou `URI:spiffe://lab.internal/billing` pour billing | `EKU clientAuth` : ne peut servir de certificat serveur. Le format du SAN distingue une identité humaine, email, d'une identité de service, URI SPIFFE |
 
 ## 3. Key compromise
 
-For the server key, a client key, the intermediate key and the root key: how would you notice,
-what stops working or becomes unsafe, how do you recover, how long does it take?
+Pour la clé serveur, une clé client, la clé intermédiaire et la clé racine : comment je le remarque, ce qui devient dangereux ou s'arrête, comment je récupère, combien de temps ça prend.
 
 ### Server key (`identities/www/www.key.pem`)
 
-- How you notice: nothing in this build detects it: no monitoring, no alert. You learn it from outside: the key
-  found in a backup, a leak, an intrusion on the host.
-- What becomes unsafe: whoever can redirect traffic (DNS, same network) can pose as `www.lab.internal`: clients send
-  it their requests and trust its answers. It still cannot reach the API as alice: it has no client key. Past
-  sessions stay unreadable: TLS 1.3 key exchange is ephemeral (forward secrecy). Nothing stops working.
-- Recovery: new key and CSR in `client`, sign in `issuing-ca`, copy to `identities/www/`, restart nginx. Revoke the
-  old serial and publish the CRL, but the clients do not check the server's revocation (`curl` reads no CRL by
-  default): the old certificate stays accepted.
-- How long: 10 minutes to reissue; the stolen certificate stays usable until it expires, at most 90 days.
+- Comment je le remarque : rien dans cette construction ne le détecte, pas de surveillance, pas d'alerte. Je l'apprends de l'extérieur, la clé retrouvée dans une sauvegarde, une fuite, une intrusion sur la machine.
+- Ce qui devient dangereux : quiconque peut rediriger le trafic, DNS ou même réseau, peut se faire passer pour `www.lab.internal`. Les clients lui envoient leurs requêtes et font confiance à ses réponses. Il ne peut toujours pas joindre l'API en tant qu'alice, il n'a pas sa clé client. Les sessions passées restent illisibles grâce au forward secrecy de TLS 1.3. Rien ne s'arrête de fonctionner.
+- Récupération : nouvelle clé et CSR dans `client`, signature dans `issuing-ca`, copie dans `identities/www/`, redémarrage de nginx. Je révoque l'ancien serial et publie la CRL, mais les clients ne vérifient pas la révocation du serveur, `curl` ne lit aucune CRL par défaut : l'ancien certificat reste accepté.
+- Durée : 10 minutes pour réémettre. Le certificat volé reste utilisable jusqu'à expiration, 90 jours maximum.
 
-### Client key
+### Client key (alice) — le scénario réellement exécuté dans ce lab
 
-- How you notice:
-- What becomes unsafe:
-- Recovery:
-- How long:
+- Comment je le remarque : rien ne le détecte automatiquement, comme pour le serveur, c'est un signal externe, un ordinateur volé signalé. Aucun journal de type certificate transparency ni surveillance sur les certificats client.
+- Ce qui devient dangereux : quiconque détient la clé s'authentifie comme `CN=alice` via le mTLS de nginx, et reçoit le rôle admin de l'API (`/admin`), puisque l'API fait confiance au CN que nginx rapporte dans `X-Client-DN`, sans autre vérification, voir `api/app.py`, fonction `caller()`.
+- Récupération, telle que réellement effectuée :
+  1. Révocation : `openssl ca -config intermediate/openssl.cnf -revoke intermediate/newcerts/1004.pem -crl_reason keyCompromise`, puis régénération de `intermediate/crl/int.crl.pem`. Confirmé dans `intermediate/index.txt`, le serial `1004` passe en `R` avec la raison `keyCompromise`.
+  2. Piège rencontré : activer seulement `ssl_crl /etc/nginx/crl/int.crl.pem;` a fait refuser tous les clients par nginx, bob y compris, pas seulement alice. Raison : nginx vérifie la révocation à chaque niveau de la chaîne, et valider l'intermédiaire elle-même demande la CRL de la racine, absente du fichier pointé. Correction : concaténer les deux CRL avec `cat intermediate/crl/int.crl.pem intermediate/crl/root.crl.pem > intermediate/crl/crl-bundle.pem`, puis pointer `ssl_crl` sur ce fichier.
+  3. Réémission : nouvelle clé EC, nouveau CSR, signé par l'intermédiaire sous le serial `1005`, copié dans `identities/alice/`. Aucun changement côté nginx : l'ancien serial, `1004`, reste dans la CRL, le nouveau, `1005`, en est simplement absent, donc les deux identités sont déjà gérées correctement par la vérification de CRL existante. Confirmé dans `intermediate/index.txt` : deux lignes pour `/CN=alice`, `R ... 1004` et `V ... 1005`.
+- Durée : révocation, correction de la CRL et réémission ont pris bien moins de 20 minutes au total dans ce lab. Ce n'est pas instantané : nginx ne relit le fichier CRL qu'au démarrage, un `docker compose restart nginx` est nécessaire après chaque changement, donc une révocation n'est visible de nginx qu'après ce redémarrage.
+- Leçon tirée de l'exercice : une première tentative de révocation n'a rien révoqué du tout, car le numéro de serial a été passé comme un simple texte que le shell a interprété comme une redirection d'entrée au lieu d'un nom de fichier. `openssl ca` a tourné sans erreur mais la base n'a pas bougé. L'échec n'a été vu qu'en relisant `intermediate/index.txt` et en remarquant que le certificat restait `V`, pas `R`. Leçon : toujours vérifier une révocation en relisant l'état de la base, pas en faisant confiance au succès apparent d'une commande.
 
 ### Intermediate key
 
-- How you notice:
-- What becomes unsafe:
-- Recovery:
-- How long:
+- Comment je le remarque : aucun mécanisme de détection dans cette construction. Il faudrait une surveillance externe, des certificats inattendus, une activité de signature inhabituelle, puisque l'intermédiaire signe en continu sans surveillance et sans passphrase qui en limite l'usage.
+- Ce qui devient dangereux : un attaquant avec cette clé peut créer n'importe quel certificat serveur ou client pour `*.lab.internal` que tous les clients du lab font déjà confiance, car ils ne vérifient que la chaîne racine plus intermédiaire, pas une empreinte précise par feuille. Bien plus grave qu'une seule identité compromise, car non limité à une seule identité.
+- Récupération : la seule vraie correction est de révoquer le certificat de l'intermédiaire elle-même, mais ça demande la racine, volontairement arrêtée pour le reste du lab, voir le checkpoint de la Phase 2, `docker compose stop root-ca`. En pratique : redémarrer `root-ca`, révoquer le serial de l'intermédiaire dans `root/index.txt`, publier une nouvelle CRL racine, la distribuer, générer une nouvelle clé et un nouveau certificat d'intermédiaire, puis réémettre chaque certificat feuille signé par l'ancienne intermédiaire, car ils ne deviennent pas invalides automatiquement.
+- Durée : bien plus long qu'une compromission de feuille, c'est en pratique une campagne complète de réémission sur toutes les identités du lab, plus la redistribution de la nouvelle CRL racine partout où elle est vérifiée.
 
 ### Root key
 
-- How you notice:
-- What becomes unsafe:
-- Recovery:
-- How long:
+- Comment je le remarque : quasiment indétectable avec les outils de ce lab. La racine est offline, donc un usage de sa clé se produirait forcément en dehors de tout ce que ce lab construit, par exemple si le fichier de clé chiffré était exfiltré et sa passphrase devinée ou volée aussi.
+- Ce qui devient dangereux : tout. Un attaquant avec la clé racine et sa passphrase peut créer une nouvelle intermédiaire entièrement fiable, avec les `nameConstraints` de son choix, et usurper tout ce qui est en dessous, puisque rien chez les clients de ce lab ne distingue la vraie racine d'une racine avec la bonne clé publique et une signature valide.
+- Récupération : il n'existe aucun mécanisme de révocation pour un certificat racine dans cette architecture, pas d'autorité CRL ou OCSP au-dessus. Récupérer signifie générer une toute nouvelle racine et redistribuer manuellement son certificat vers le `--cacert` ou le magasin de confiance de chaque client, une opération manuelle coordonnée sur chaque machine qui fait confiance à l'ancienne racine.
+- Durée : en pratique illimitée avec cette conception, aucun canal automatique ne pousse une nouvelle racine vers les clients, tout dépend d'une redistribution manuelle.
 
 ## 4. Operational gaps
 
-search answer to those questions/weaknesses
-
-- the root key's passphrase: where is it, who knows it? What if that person leaves the company?
-- the CRL expires after 7 days: what happens on day 8, and who regenerates it?
-- the lab root is in no trust store: how would every laptop, server and container get it?
-- the intermediate's key is not encrypted, unlike the root's. Search how it would be possible to use KMS for intermediate issuing CA.
-
+- La passphrase de la clé racine : seul moi la connais dans ce lab, elle n'existe nulle part ailleurs que dans ma mémoire et ce que j'ai tapé dans `openssl genpkey -aes-256-cbc`. Si je partais, personne ne pourrait réutiliser la racine, y compris pour émettre une nouvelle intermédiaire légitime, tant qu'elle ne serait pas régénérée. En production, ça se résout par un partage de secret, m-of-n, par exemple Shamir's Secret Sharing entre plusieurs porteurs de confiance, ou en n'ayant jamais de passphrase du tout car la clé vit dans un HSM qui effectue lui-même l'opération de signature.
+- La CRL expire après 7 jours pour l'intermédiaire et 180 jours pour la racine : au jour 8, ou au jour 181, tout client qui vérifie strictement la fraîcheur de la CRL commencerait à refuser tout le monde, exactement comme le bug rencontré en Phase 5, mais causé par le temps plutôt que par un fichier manquant. Personne ni rien ne régénère et republie automatiquement la CRL dans ce lab, c'est une étape manuelle, `openssl ca -gencrl`. En production il faut une tâche planifiée, cron ou systemd timer, bien avant la fin de validité, avec une alerte en cas d'échec.
+- La racine du lab n'est dans aucun magasin de confiance : chaque client doit passer `--cacert root/certs/ca.cert.pem` explicitement, rien ne lui fait confiance par défaut. Déployer ça sur de vrais postes, serveurs ou conteneurs demanderait soit d'installer le certificat racine dans chaque magasin de confiance du système ou du navigateur via de la gestion de configuration, soit, mieux, d'utiliser un protocole comme ACME, EST ou SPIFFE qui distribue et peut faire tourner les bundles de confiance automatiquement.
+- La clé de l'intermédiaire n'est pas chiffrée, contrairement à celle de la racine : elle reste disponible en clair sur disque, car `openssl ca` doit signer à la demande sans qu'un humain tape une passphrase à chaque fois, ce qui bloquerait le service. La correction en production est un KMS ou un HSM : AWS KMS, Google Cloud KMS, le moteur PKI de HashiCorp Vault, ou un HSM matériel via PKCS#11 peuvent détenir la clé privée de l'intermédiaire et effectuer la signature en interne via un appel d'API. La clé brute ne sort jamais du KMS ou du HSM, chaque signature est journalisée et auditable, et le processus de la CA n'a jamais besoin d'une passphrase tapée par un humain pour continuer à tourner.
+- Lacune trouvée par hasard pendant le lab, utile à ajouter : après un redémarrage de la machine, nginx a planté au démarrage, `host not found in upstream "api"`, car il résout le nom DNS d'`api` une seule fois au démarrage, et `api` n'était pas encore démarré. Il n'existe aucun `depends_on` ni vérification de santé dans `docker-compose.yml`. En production il faudrait soit une dépendance de démarrage avec vérification de disponibilité, soit la directive `resolver` dynamique de nginx au lieu d'un nom d'upstream figé.
